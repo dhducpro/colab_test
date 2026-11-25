@@ -5,6 +5,8 @@ from time import perf_counter
 
 import numpy as np
 
+from pdpcr.schedule import reroute_schedule
+
 from .core import evaluate, greedy
 from .redistribute import redistribute_cut
 
@@ -34,16 +36,58 @@ def _candidate(instance, original, changes, kind):
     return Candidate(out, obj, kind, added, removed)
 
 
-def critical_arcs(instance, flow):
-    schedule = evaluate(instance, flow)
+def critical_arcs(instance, flow, schedule=None):
+    if schedule is None:
+        schedule = evaluate(instance, flow)
     return [(int(i), int(j)) for i, j in zip(*np.nonzero(flow))
             if abs(schedule.starts[i]+instance.processing[i]+instance.travel[i][j]
                    +schedule.tails[j]-schedule.makespan) < 1e-7]
 
 
+def _reroute_creates_cycle(flow, succ, position, i, j, u, v, q):
+    """Exact cycle test for the reroute (i,j),(u,v) -> (i,v),(u,j) (patch).
+
+    The current support is acyclic and only the arcs (i,v) and (u,j) are added,
+    so a cycle must use an added arc (a,b) that goes backward in the current
+    topological order, and then b reaches a in the modified support. Forward
+    added arcs need no test. This returns True exactly when the full
+    evaluation would reject the candidate.
+    """
+    added = ((i, v), (u, j))
+    backward = [(a, b) for a, b in added if position[a] >= position[b]]
+    if not backward:
+        return False
+    removed = set()
+    if flow[i, j] - q == 0:
+        removed.add((i, j))
+    if flow[u, v] - q == 0:
+        removed.add((u, v))
+    extra = {}
+    for a, b in added:
+        extra.setdefault(a, []).append(b)
+    for a, b in backward:
+        stack, seen = [b], {b}
+        while stack:
+            x = stack.pop()
+            if x == a:
+                return True
+            for y in succ[x] + extra.get(x, []):
+                if (x, y) not in removed and y not in seen:
+                    seen.add(y)
+                    stack.append(y)
+    return False
+
+
 def reroute_neighbors(instance, flow, deadline=None, max_candidates=None, rng=None):
     arcs = [(int(i), int(j)) for i, j in zip(*np.nonzero(flow))]
-    critical = critical_arcs(instance, flow)
+    schedule = evaluate(instance, flow)
+    critical = critical_arcs(instance, flow, schedule)
+    position = {node: k for k, node in enumerate(schedule.order)}
+    succ = [[] for _ in range(instance.size)]
+    indegree = [0] * instance.size
+    for a, b in arcs:
+        succ[a].append(b)
+        indegree[b] += 1
     if not critical:
         return []
     i, j = min(critical, key=lambda a: (-instance.travel[a[0]][a[1]], a))
@@ -56,20 +100,29 @@ def reroute_neighbors(instance, flow, deadline=None, max_candidates=None, rng=No
         if i == u or j == v:
             continue
         q = min(flow[i, j], flow[u, v])
-        # Correct endpoint is (u,j); the manuscript mistakenly prints (v,j).
-        c = _candidate(instance, flow,
-                       [(i,j,-q), (u,v,-q), (i,v,q), (u,j,q)], "reroute")
-        if c:
-            out.append(c)
-            if max_candidates is not None and len(out)>=max_candidates:
-                break
+        if _reroute_creates_cycle(flow, succ, position, i, j, u, v, q):
+            continue
+        # Only copy the dense values after evaluating the sparse candidate.
+        paths = reroute_schedule(instance, flow, succ, indegree, i, j, u, v, q)
+        if paths is None:
+            continue
+        changed = flow.copy()
+        changed[i, j] -= q
+        changed[u, v] -= q
+        changed[i, v] += q
+        changed[u, j] += q
+        _, starts, _ = paths
+        out.append(Candidate(changed, starts[-1], "reroute",
+                             sorted([(i, v), (u, j)]), sorted([(i, j), (u, v)])))
+        if max_candidates is not None and len(out) >= max_candidates:
+            break
     return out
 
 
 def reverse_neighbors(instance, flow, deadline=None, max_candidates=None, rng=None):
     schedule = evaluate(instance, flow)
     out = []
-    arcs=critical_arcs(instance,flow)
+    arcs=critical_arcs(instance,flow,schedule)
     if rng is not None:
         rng.shuffle(arcs)
     for i, j in arcs:

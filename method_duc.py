@@ -47,4 +47,5 @@ def run(instance_dict, initial_dense, seed, seconds, config):
         "flow": result["flow"].tolist(),
         "iterations": result["iterations_completed"],
         "reported": float(result["objective"]),
+        "history": result["history"],
     }

@@ -6,6 +6,19 @@ import numpy as np
 from .core import checked_flow, evaluate
 
 
+_ARRAY_CACHE = {}
+
+
+def _arrays(instance):
+    """Numpy copies of the travel matrix and processing times, cached per instance."""
+    entry = _ARRAY_CACHE.get(id(instance))
+    if entry is None or entry[0] is not instance:
+        entry = (instance, np.asarray(instance.travel, dtype=float),
+                 np.asarray(instance.processing, dtype=float))
+        _ARRAY_CACHE[id(instance)] = entry
+    return entry[1], entry[2]
+
+
 def _transport(cost, initial):
     d = np.asarray(cost, dtype=float)
     a = np.asarray(initial, dtype=float)
@@ -46,9 +59,9 @@ def alternating_redistribute(cost, initial):
         while queue and target not in previous:
             node = queue.popleft()
             if node < rows:
-                nxt = [rows+j for j in range(cols) if d[node, j] < c]
+                nxt = (rows + np.flatnonzero(d[node] < c)).tolist()
             else:
-                nxt = [i for i in range(rows) if f[i, node-rows] > 0]
+                nxt = np.flatnonzero(f[:, node-rows] > 0).tolist()
             for other in nxt:
                 if other not in previous:
                     previous[other] = node
@@ -144,9 +157,11 @@ def redistribute_cut(instance, flow, cut, method="alternating"):
     if not 1 <= cut < instance.size:
         raise ValueError("Cut must keep source left and sink right")
     left, right = schedule.order[:cut], schedule.order[cut:]
-    d = np.array([[schedule.starts[i] + instance.processing[i]
-                   + instance.travel[i][j] + schedule.tails[j]
-                   for j in right] for i in left])
+    # Patch: vectorized, with the same left-to-right order of additions.
+    travel, processing = _arrays(instance)
+    L, R = np.asarray(left), np.asarray(right)
+    d = ((schedule.starts[L] + processing[L])[:, None]
+         + travel[np.ix_(L, R)]) + schedule.tails[R][None, :]
     old = np.asarray(flow)[np.ix_(left, right)]
     solver = {"alternating": alternating_redistribute,
               "threshold": threshold_redistribute}[method]

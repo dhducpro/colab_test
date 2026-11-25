@@ -269,7 +269,7 @@ def mutate(instance, parent, rng, beta=0.05, strategy='mixed', deadline=None):
     return reroute_mutation(instance, parent, rng), "reroute"
 
 
-def local_descent(instance, parent, rng, max_steps=3, max_candidates=8, deadline=None):
+def local_descent(instance, parent, rng, max_steps=3, max_candidates=8, deadline=None, *, on_improvement=None):
     """Strict descent using the three existing feasible TSR neighborhoods.
 
     Each round samples up to K valid reroute moves, K valid reverse moves and
@@ -316,6 +316,8 @@ def local_descent(instance, parent, rng, max_steps=3, max_candidates=8, deadline
         if current.objective >= previous - 1e-9:
             raise AssertionError("Local descent must strictly improve its input")
         stats["steps"] += 1
+        if on_improvement is not None:
+            on_improvement(current)
     stats.update(seconds=perf_counter()-started,
                  gain=parent.objective-current.objective)
     return current, stats

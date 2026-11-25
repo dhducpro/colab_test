@@ -3,7 +3,7 @@
 The upstream code uses node -1 for the returning depot. The benchmark uses
 the last nonnegative index. Both representations use the supplied travel and
 processing times. Neighborhood generation, admissibility, and restarts use
-the upstream implementation, including its original tabu-list updates.
+the upstream implementation, with the cut tabu list updated by an explicit append.
 """
 
 from functools import lru_cache
@@ -154,7 +154,9 @@ def run(instance_dict, initial_dense, seed, seconds, config):
     best_score = search._get_fitness(graph)
     if not math.isfinite(best_score):
         raise ValueError("The initial flow does not reach the returning depot.")
-    deadline = process_time() + seconds
+    started = process_time()
+    deadline = started + seconds
+    trace = [(0.0, float(best_score))]
 
     def check_budget():
         if process_time() >= deadline:
@@ -164,6 +166,7 @@ def run(instance_dict, initial_dense, seed, seconds, config):
         nonlocal best_graph, best_score
         check_budget()
         best_graph, best_score = candidate, score
+        trace.append((process_time() - started, float(score)))
 
     search.common_initial = graph
     search.completed = 0
@@ -178,4 +181,4 @@ def run(instance_dict, initial_dense, seed, seconds, config):
     for i, j, data in best_graph.edges(data=True):
         flow[sink if i == -1 else i][sink if j == -1 else j] = int(data["weight"])
     return {"flow": flow, "reported": float(best_score), "iterations": search.completed,
-            "diagnostics": search.diagnostics}
+            "diagnostics": search.diagnostics, "history": trace}

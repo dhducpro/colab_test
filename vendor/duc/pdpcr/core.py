@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import heapq
 import json
 from pathlib import Path
 import random
 
 import numpy as np
+
+from pdpcr.schedule import longest_paths
 
 
 @dataclass
@@ -62,13 +63,26 @@ class Instance:
 
 
 def checked_flow(instance: Instance, flow):
-    """Check integer robots, allowed arcs, and all row/column balances."""
-    a = np.asarray(flow, dtype=float)
-    if a.shape != (instance.size, instance.size) or not np.all(np.isfinite(a)):
+    """Check integer robots, allowed arcs, and all row/column balances.
+
+    Fast path (patch): integer arrays skip the float conversion and the
+    tolerance-based integrality test, which are only needed for MILP output.
+    The checks performed and the errors raised are otherwise unchanged.
+    """
+    a = np.asarray(flow)
+    if a.shape != (instance.size, instance.size):
         raise ValueError("Invalid flow dimensions/values")
-    if np.any(a < -1e-7) or not np.allclose(a, np.rint(a), atol=1e-7, rtol=0):
-        raise ValueError("Robot flows must be nonnegative integers")
-    f = np.rint(a).astype(int)
+    if np.issubdtype(a.dtype, np.integer):
+        if np.any(a < 0):
+            raise ValueError("Robot flows must be nonnegative integers")
+        f = a.astype(int)
+    else:
+        a = a.astype(float)
+        if not np.all(np.isfinite(a)):
+            raise ValueError("Invalid flow dimensions/values")
+        if np.any(a < -1e-7) or not np.allclose(a, np.rint(a), atol=1e-7, rtol=0):
+            raise ValueError("Robot flows must be nonnegative integers")
+        f = np.rint(a).astype(int)
     if np.any(np.diag(f)) or np.any(f[:, 0]) or np.any(f[-1, :]):
         raise ValueError("Self-loops, arcs into source, and arcs out of sink are forbidden")
     if not np.array_equal(f.sum(axis=1), instance.requirements[:-1] + [0]):
@@ -89,35 +103,20 @@ class Schedule:
 def evaluate(instance: Instance, flow) -> Schedule:
     """Algorithms 1 and 2; ties in Kahn's topological sort use node ID."""
     f = checked_flow(instance, flow)
-    adj = [list(np.flatnonzero(row)) for row in f]
-    indegree = (f > 0).sum(axis=0)
-    ready = [int(i) for i in np.flatnonzero(indegree == 0)]
-    heapq.heapify(ready)
-    order = []
-    while ready:
-        i = heapq.heappop(ready)
-        order.append(i)
-        for j in adj[i]:
-            indegree[j] -= 1
-            if indegree[j] == 0:
-                heapq.heappush(ready, int(j))
-    if len(order) != instance.size:
+    # Patch: one sparse pass instead of one np.flatnonzero call per row.
+    # np.nonzero returns arcs in row-major order, so every successor list is
+    # in increasing node order, exactly as before.
+    rows, cols = np.nonzero(f)
+    adj = [[] for _ in range(instance.size)]
+    indegree = [0] * instance.size
+    for i, j in zip(rows.tolist(), cols.tolist()):
+        adj[i].append(j)
+        indegree[j] += 1
+    paths = longest_paths(adj, indegree, instance.processing, instance.travel)
+    if paths is None:
         raise ValueError("Cyclic flow graph")
-    starts = np.full(instance.size, -np.inf)
-    starts[0] = 0.0
-    for i in order:
-        for j in adj[i]:
-            starts[j] = max(starts[j], starts[i] + instance.processing[i]
-                            + instance.travel[i][j])
-    tails = np.full(instance.size, -np.inf)
-    tails[instance.sink] = 0.0
-    for i in reversed(order):
-        for j in adj[i]:
-            tails[i] = max(tails[i], instance.processing[i]
-                           + instance.travel[i][j] + tails[j])
-    if not np.all(np.isfinite(starts)) or not np.all(np.isfinite(tails)):
-        raise ValueError("Every task must lie on a source-to-sink robot path")
-    return Schedule(float(starts[-1]), starts, tails, order)
+    order, starts, tails = paths
+    return Schedule(starts[-1], np.asarray(starts), np.asarray(tails), order)
 
 
 def flow_from_routes(instance: Instance, routes):

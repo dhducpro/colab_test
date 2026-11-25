@@ -7,6 +7,9 @@ import time
 from types import SimpleNamespace
 
 
+from pdpcr.schedule import longest_paths
+
+
 VENDOR = Path(__file__).resolve().parent / "vendor" / "claude"
 
 
@@ -37,6 +40,26 @@ def _load_tsr():
             raise RuntimeError(f"Unexpected Claude algos.py version at {original!r}")
         source = source.replace(original, adapted)
     exec(compile(source, str(VENDOR / "algos.py"), "exec"), namespace)
+    # Preserve Claude's FIFO order and critical-arc ordering on the shared kernel.
+    def evaluate(inst, sol, eps=1e-9):
+        out, incoming = sol
+        paths = longest_paths(out, [len(row) for row in incoming], inst.c, inst.t, fifo=True)
+        if paths is None:
+            return None
+        ev = namespace["Eval"]()
+        ev.order, ev.z, ev.tau = paths
+        ev.pos = [0] * len(out)
+        ev.cmax = ev.z[-1]
+        ev.crit_arcs = []
+        for k, i in enumerate(ev.order):
+            ev.pos[i] = k
+            finish = ev.z[i] + inst.c[i]
+            ev.crit_arcs.extend((i, j) for j in out[i]
+                                if abs(finish + inst.t[i][j] + ev.tau[j] - ev.cmax) <= eps)
+        ev.crit = len(ev.crit_arcs)
+        return ev
+
+    namespace["evaluate"] = evaluate
     namespace["time"] = SimpleNamespace(time=time.process_time)
     native_reroute = namespace["reroute_candidates"]
 
@@ -62,13 +85,14 @@ def run(instance_dict, initial_dense, seed, seconds, config):
             if amount:
                 vendor.add_flow(initial, i, j, amount)
     vendor.check_feasible(inst, initial)
+    trace = []
     best, evaluation, iterations = vendor.tabu_search(
         inst, None, False, seconds, seed, initial, config, beta=config["beta"],
-        I1=config["restart_best"], I2=config["restart_new"],
+        I1=config["restart_best"], I2=config["restart_new"], trace=trace,
     )
     size = inst.n + 2
     flow = [[0] * size for _ in range(size)]
     for i, arcs in enumerate(best[0]):
         for j, amount in arcs.items():
             flow[i][j] = int(amount)
-    return {"flow": flow, "iterations": iterations, "reported": float(evaluation.cmax)}
+    return {"flow": flow, "iterations": iterations, "reported": float(evaluation.cmax), "history": trace}

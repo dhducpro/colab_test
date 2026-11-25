@@ -1,5 +1,13 @@
-# PDP-CR Colab benchmark
+# PDP-CR experiments
 
-Compare TSR (Thao, Duc and Claude) and GA v2 on `lr108-5-uniform.csv`. All methods use the same greedy starting flow. The default runs five seeds per method with 600 CPU seconds per seed.
+Open [PDPCR_Hung_Study_Colab.ipynb](https://colab.research.google.com/github/dhducpro/colab_test/blob/main/PDPCR_Hung_Study_Colab.ipynb), select CPU, and choose a mode in cell 2. The default runs LR108 with five seeds and 600 CPU seconds per seed. Result JSON files include the input hash, code hash, robot routes, feasibility-checked makespan, full saved best-so-far trace, and GA diversity statistics.
 
-Open `PDPCR_Thao_Colab.ipynb` in Google Colab. The output includes the mean and best makespan, the per-seed table, and individual solution files.
+**Reference reproduction.** The vendor copies of Claude's `pdpcr.py`, `algos.py`, `run.py` and `run2.py` are unchanged. The two Claude modes use the paper's instance generators, random starts, default restart thresholds 150/300, wall clock and sequential execution.
+
+**Matched experiments.** All solvers start from the same deterministic greedy flow. The three default TSRs use beta 0.3 and 300/600 restarts with the neighborhood and tenure sizes scaled by instance size. Claude, Duc and both GAs use the shared sparse longest-path routine, with each solver's original topological tie rule. Duc applies the distributed speed patch and evaluates reroute moves on the modified sparse support. Thao runs with her NetworkX implementation as an external reference. The GA and some moves retain dense flow arrays. Incremental start-time propagation is outside this implementation.
+
+**GA variants.** `ga_pure` implements the core of proposal v2. `ga_pilot` uses the earlier pilot's best-of-four crossover, order-changing mutation, adaptive rate, immigrants and two-step descent. `ablation` also tests no crossover, a single random cycle, no order-changing mutation, depth 0/4, alternative population sizes and mutation rates, cut crossover, each mutation family, and CutIntensify. MLS restarts after a sampled neighborhood yields no strict improving move, using the same moves as the GA. The multi-start TSR divides the total budget among five searches.
+
+**Checks and reports.** `performance` compares fixed-work digests before the patch, after the official patch and after the shared-kernel change, then measures throughput on the same machine. `calibration` exports the Duc-to-Claude iteration-rate ratio. `families` exports per-instance means, standard deviations, best results, anytime values at 10/25/50/100% of the CPU budget, and Wilcoxon tests on paired instance means. `exact` uses the existing CPLEX flow-DAG model with a greedy MIP start. It reports a lower bound and distinguishes a feasible incumbent from an optimum certified by CPLEX. A licensed CPLEX executable or Python API is required for the 50-task model. Full campaign results and manuscript claims require completed runs.
+
+The previous single-instance notebook is `PDPCR_Thao_Colab.ipynb`.

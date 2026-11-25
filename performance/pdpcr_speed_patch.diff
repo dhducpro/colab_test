@@ -1,0 +1,187 @@
+diff -ruN orig/pdpcr/core.py patched/pdpcr/core.py
+--- orig/pdpcr/core.py	2026-11-20 07:37:09.327808308 +0000
++++ patched/pdpcr/core.py	2026-11-20 07:37:09.452327579 +0000
+@@ -62,13 +62,26 @@
+ 
+ 
+ def checked_flow(instance: Instance, flow):
+-    """Check integer robots, allowed arcs, and all row/column balances."""
+-    a = np.asarray(flow, dtype=float)
+-    if a.shape != (instance.size, instance.size) or not np.all(np.isfinite(a)):
++    """Check integer robots, allowed arcs, and all row/column balances.
++
++    Fast path (patch): integer arrays skip the float conversion and the
++    tolerance-based integrality test, which are only needed for MILP output.
++    The checks performed and the errors raised are otherwise unchanged.
++    """
++    a = np.asarray(flow)
++    if a.shape != (instance.size, instance.size):
+         raise ValueError("Invalid flow dimensions/values")
+-    if np.any(a < -1e-7) or not np.allclose(a, np.rint(a), atol=1e-7, rtol=0):
+-        raise ValueError("Robot flows must be nonnegative integers")
+-    f = np.rint(a).astype(int)
++    if np.issubdtype(a.dtype, np.integer):
++        if np.any(a < 0):
++            raise ValueError("Robot flows must be nonnegative integers")
++        f = a.astype(int)
++    else:
++        a = a.astype(float)
++        if not np.all(np.isfinite(a)):
++            raise ValueError("Invalid flow dimensions/values")
++        if np.any(a < -1e-7) or not np.allclose(a, np.rint(a), atol=1e-7, rtol=0):
++            raise ValueError("Robot flows must be nonnegative integers")
++        f = np.rint(a).astype(int)
+     if np.any(np.diag(f)) or np.any(f[:, 0]) or np.any(f[-1, :]):
+         raise ValueError("Self-loops, arcs into source, and arcs out of sink are forbidden")
+     if not np.array_equal(f.sum(axis=1), instance.requirements[:-1] + [0]):
+@@ -89,9 +102,16 @@
+ def evaluate(instance: Instance, flow) -> Schedule:
+     """Algorithms 1 and 2; ties in Kahn's topological sort use node ID."""
+     f = checked_flow(instance, flow)
+-    adj = [list(np.flatnonzero(row)) for row in f]
+-    indegree = (f > 0).sum(axis=0)
+-    ready = [int(i) for i in np.flatnonzero(indegree == 0)]
++    # Patch: one sparse pass instead of one np.flatnonzero call per row.
++    # np.nonzero returns arcs in row-major order, so every successor list is
++    # in increasing node order, exactly as before.
++    rows, cols = np.nonzero(f)
++    adj = [[] for _ in range(instance.size)]
++    indegree = [0] * instance.size
++    for i, j in zip(rows.tolist(), cols.tolist()):
++        adj[i].append(j)
++        indegree[j] += 1
++    ready = [i for i in range(instance.size) if indegree[i] == 0]
+     heapq.heapify(ready)
+     order = []
+     while ready:
+diff -ruN orig/pdpcr/redistribute.py patched/pdpcr/redistribute.py
+--- orig/pdpcr/redistribute.py	2026-11-20 07:37:09.328738971 +0000
++++ patched/pdpcr/redistribute.py	2026-11-20 07:37:09.452809947 +0000
+@@ -6,6 +6,19 @@
+ from .core import checked_flow, evaluate
+ 
+ 
++_ARRAY_CACHE = {}
++
++
++def _arrays(instance):
++    """Numpy copies of the travel matrix and processing times, cached per instance."""
++    entry = _ARRAY_CACHE.get(id(instance))
++    if entry is None or entry[0] is not instance:
++        entry = (instance, np.asarray(instance.travel, dtype=float),
++                 np.asarray(instance.processing, dtype=float))
++        _ARRAY_CACHE[id(instance)] = entry
++    return entry[1], entry[2]
++
++
+ def _transport(cost, initial):
+     d = np.asarray(cost, dtype=float)
+     a = np.asarray(initial, dtype=float)
+@@ -46,9 +59,9 @@
+         while queue and target not in previous:
+             node = queue.popleft()
+             if node < rows:
+-                nxt = [rows+j for j in range(cols) if d[node, j] < c]
++                nxt = (rows + np.flatnonzero(d[node] < c)).tolist()
+             else:
+-                nxt = [i for i in range(rows) if f[i, node-rows] > 0]
++                nxt = np.flatnonzero(f[:, node-rows] > 0).tolist()
+             for other in nxt:
+                 if other not in previous:
+                     previous[other] = node
+@@ -144,9 +157,11 @@
+     if not 1 <= cut < instance.size:
+         raise ValueError("Cut must keep source left and sink right")
+     left, right = schedule.order[:cut], schedule.order[cut:]
+-    d = np.array([[schedule.starts[i] + instance.processing[i]
+-                   + instance.travel[i][j] + schedule.tails[j]
+-                   for j in right] for i in left])
++    # Patch: vectorized, with the same left-to-right order of additions.
++    travel, processing = _arrays(instance)
++    L, R = np.asarray(left), np.asarray(right)
++    d = ((schedule.starts[L] + processing[L])[:, None]
++         + travel[np.ix_(L, R)]) + schedule.tails[R][None, :]
+     old = np.asarray(flow)[np.ix_(left, right)]
+     solver = {"alternating": alternating_redistribute,
+               "threshold": threshold_redistribute}[method]
+diff -ruN orig/pdpcr/search.py patched/pdpcr/search.py
+--- orig/pdpcr/search.py	2026-11-20 07:37:09.328779603 +0000
++++ patched/pdpcr/search.py	2026-11-20 07:37:09.452653488 +0000
+@@ -34,16 +34,56 @@
+     return Candidate(out, obj, kind, added, removed)
+ 
+ 
+-def critical_arcs(instance, flow):
+-    schedule = evaluate(instance, flow)
++def critical_arcs(instance, flow, schedule=None):
++    if schedule is None:
++        schedule = evaluate(instance, flow)
+     return [(int(i), int(j)) for i, j in zip(*np.nonzero(flow))
+             if abs(schedule.starts[i]+instance.processing[i]+instance.travel[i][j]
+                    +schedule.tails[j]-schedule.makespan) < 1e-7]
+ 
+ 
++def _reroute_creates_cycle(flow, succ, position, i, j, u, v, q):
++    """Exact cycle test for the reroute (i,j),(u,v) -> (i,v),(u,j) (patch).
++
++    The current support is acyclic and only the arcs (i,v) and (u,j) are added,
++    so a cycle must use an added arc (a,b) that goes backward in the current
++    topological order, and then b reaches a in the modified support. Forward
++    added arcs need no test. This returns True exactly when the full
++    evaluation would reject the candidate.
++    """
++    added = ((i, v), (u, j))
++    backward = [(a, b) for a, b in added if position[a] >= position[b]]
++    if not backward:
++        return False
++    removed = set()
++    if flow[i, j] - q == 0:
++        removed.add((i, j))
++    if flow[u, v] - q == 0:
++        removed.add((u, v))
++    extra = {}
++    for a, b in added:
++        extra.setdefault(a, []).append(b)
++    for a, b in backward:
++        stack, seen = [b], {b}
++        while stack:
++            x = stack.pop()
++            if x == a:
++                return True
++            for y in succ[x] + extra.get(x, []):
++                if (x, y) not in removed and y not in seen:
++                    seen.add(y)
++                    stack.append(y)
++    return False
++
++
+ def reroute_neighbors(instance, flow, deadline=None, max_candidates=None, rng=None):
+     arcs = [(int(i), int(j)) for i, j in zip(*np.nonzero(flow))]
+-    critical = critical_arcs(instance, flow)
++    schedule = evaluate(instance, flow)
++    critical = critical_arcs(instance, flow, schedule)
++    position = {node: k for k, node in enumerate(schedule.order)}
++    succ = [[] for _ in range(instance.size)]
++    for a, b in arcs:
++        succ[a].append(b)
+     if not critical:
+         return []
+     i, j = min(critical, key=lambda a: (-instance.travel[a[0]][a[1]], a))
+@@ -56,6 +96,8 @@
+         if i == u or j == v:
+             continue
+         q = min(flow[i, j], flow[u, v])
++        if _reroute_creates_cycle(flow, succ, position, i, j, u, v, q):
++            continue
+         # Correct endpoint is (u,j); the manuscript mistakenly prints (v,j).
+         c = _candidate(instance, flow,
+                        [(i,j,-q), (u,v,-q), (i,v,q), (u,j,q)], "reroute")
+@@ -69,7 +111,7 @@
+ def reverse_neighbors(instance, flow, deadline=None, max_candidates=None, rng=None):
+     schedule = evaluate(instance, flow)
+     out = []
+-    arcs=critical_arcs(instance,flow)
++    arcs=critical_arcs(instance,flow,schedule)
+     if rng is not None:
+         rng.shuffle(arcs)
+     for i, j in arcs:
