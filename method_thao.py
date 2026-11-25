@@ -32,7 +32,7 @@ def _replace_once(source, old, new):
     return source.replace(old, new)
 
 
-def _instrument(source):
+def _instrument(source, use_original_cut_update=False):
     # Keep the dependency optional for the four separate integer-programming
     # methods. The tabu search and its randomized restart do not use them.
     source = _replace_once(source, "from docplex.mp.model import Model",
@@ -68,13 +68,19 @@ def _instrument(source):
                            "if beta > cfg.TABU_REDISTRIBUTE_PROB and affected_add and best_neighbor_0 is None:\n"
                            "                    self.diagnostics['tie_guard_uses'] += 1\n"
                            "                if beta > cfg.TABU_REDISTRIBUTE_PROB and best_neighbor_0 is not None:")
-    # The sampled cut is a NumPy scalar. Adding it with += leaves the list empty.
-    source = _replace_once(source, "tl_redistribute += affected_redistribute[best_neighbor]",
-                           "tl_redistribute.append(int(affected_redistribute[best_neighbor]))\n"
+    cut_update = "tl_redistribute += affected_redistribute[best_neighbor]"
+    trim_cut_list = "[tl_redistribute.pop(i) for i in range(len(tl_redistribute) - cfg.TABU_TL_REDISTRIBUTE_SIZE)]"
+    if not use_original_cut_update:
+        # The sampled cut is a NumPy scalar. Adding it with += leaves the list empty.
+        source = _replace_once(source, cut_update,
+                               "tl_redistribute.append(int(affected_redistribute[best_neighbor]))")
+        cut_update = "tl_redistribute.append(int(affected_redistribute[best_neighbor]))"
+        source = _replace_once(source, trim_cut_list,
+                               "del tl_redistribute[:len(tl_redistribute) - cfg.TABU_TL_REDISTRIBUTE_SIZE]")
+        trim_cut_list = "del tl_redistribute[:len(tl_redistribute) - cfg.TABU_TL_REDISTRIBUTE_SIZE]"
+    source = _replace_once(source, cut_update, cut_update + "\n"
                            "                self.diagnostics['accepted_redistribute'] += 1")
-    source = _replace_once(source,
-                           "[tl_redistribute.pop(i) for i in range(len(tl_redistribute) - cfg.TABU_TL_REDISTRIBUTE_SIZE)]",
-                           "del tl_redistribute[:len(tl_redistribute) - cfg.TABU_TL_REDISTRIBUTE_SIZE]\n"
+    source = _replace_once(source, trim_cut_list, trim_cut_list + "\n"
                            "            self.diagnostics['max_cut_tabu_length'] = max(\n"
                            "                self.diagnostics['max_cut_tabu_length'], len(tl_redistribute))")
     # The source divides by the requested candidate counts in a logging-only
@@ -85,12 +91,28 @@ def _instrument(source):
 
 
 @lru_cache(maxsize=None)
-def _compile_module(name):
+def _compile_module(name, use_original_cut_update=False):
     path = VENDOR / f"{name}.py"
     source = path.read_text(encoding="utf-8-sig")
     if name == "heuristic":
-        source = _instrument(source)
+        source = _instrument(source, use_original_cut_update)
     return compile(source, str(path), "exec")
+
+
+def original_settings():
+    """Use settings from the upstream writing_paper config."""
+    cfg = {}
+    exec(_compile_module("config"), cfg)
+    return dict(n_reroute=cfg["TABU_NUM_REROUTE_NEIGHBORS"],
+                n_reverse=cfg["TABU_NUM_REVERSE_NEIGHBORS"],
+                n_redistribute=cfg["TABU_NUM_REDISTRIBUTE_NEIGHBORS"],
+                tenure_arc=cfg["TABU_MAX_TL_ADD_SIZE"], tenure_cut=cfg["TABU_TL_REDISTRIBUTE_SIZE"],
+                beta=cfg["TABU_REDISTRIBUTE_PROB"], restart_best=cfg["TABU_FIND_FROM_ELITE_AFTER"],
+                restart_new=cfg["TABU_RESTART_AFTER"],
+                reroute_on_critical=cfg["TABU_REROUTE_ON_CRITICAL"],
+                reverse_on_critical=cfg["TABU_REVERSE_ON_CRITICAL"],
+                reroute_longest_edge=cfg["TABU_REROUTE_LONGEST_EDGE"],
+                use_original_cut_update=True)
 
 
 def _load_modules(config, seed):
@@ -103,7 +125,8 @@ def _load_modules(config, seed):
             module = ModuleType(name)
             module.__file__ = str(path)
             sys.modules[name] = module
-            exec(_compile_module(name), module.__dict__)
+            use_original_cut_update = name == "heuristic" and config.get("use_original_cut_update", False)
+            exec(_compile_module(name, use_original_cut_update), module.__dict__)
             if name == "config":
                 module.RND_SEED = seed
                 module.TABU_REDISTRIBUTE_PROB = config["beta"]

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 
 from pdpcr.schedule import longest_paths
+from pdpcr import tsr_improved
 
 
 VENDOR = Path(__file__).resolve().parent / "vendor" / "claude"
@@ -68,12 +69,13 @@ def _load_tsr():
         return native_reroute(inst, sol, ev, i, j, grid, sp, k, rng) if k else []
 
     namespace["reroute_candidates"] = reroute_with_budget
-    return SimpleNamespace(**{name: namespace[name] for name in
-                              ("empty_sol", "add_flow", "check_feasible", "tabu_search")})
+    return SimpleNamespace(**{name: namespace[name] for name in (
+        "empty_sol", "add_flow", "check_feasible", "tabu_search", "evaluate", "reroute",
+        "reverse", "draw_cuts", "redistribute", "new_construction", "copy_sol",
+    )})
 
 
-def run(instance_dict, initial_dense, seed, seconds, config):
-    """Return the best flow, reported makespan and number of TSR iterations."""
+def prepare_sparse(instance_dict, initial_dense):
     vendor = _load_tsr()
     inst = SimpleNamespace(name=instance_dict["name"], m=instance_dict["robots"],
                            n=len(instance_dict["requirements"]) - 2,
@@ -85,14 +87,31 @@ def run(instance_dict, initial_dense, seed, seconds, config):
             if amount:
                 vendor.add_flow(initial, i, j, amount)
     vendor.check_feasible(inst, initial)
-    trace = []
-    best, evaluation, iterations = vendor.tabu_search(
-        inst, None, False, seconds, seed, initial, config, beta=config["beta"],
-        I1=config["restart_best"], I2=config["restart_new"], trace=trace,
-    )
-    size = inst.n + 2
+    return inst, initial, vendor
+
+
+def dense_flow(sparse):
+    size = len(sparse[0])
     flow = [[0] * size for _ in range(size)]
-    for i, arcs in enumerate(best[0]):
+    for i, arcs in enumerate(sparse[0]):
         for j, amount in arcs.items():
             flow[i][j] = int(amount)
-    return {"flow": flow, "iterations": iterations, "reported": float(evaluation.cmax), "history": trace}
+    return flow
+
+
+def run(instance_dict, initial_dense, seed, seconds, config, *, improved=False, relocate=False):
+    """Return the best flow, reported makespan and number of TSR iterations."""
+    inst, initial, vendor = prepare_sparse(instance_dict, initial_dense)
+    diagnostics = {}
+    if improved:
+        best, evaluation, iterations, trace, diagnostics = tsr_improved.tabu_search(
+            inst, initial, vendor, seconds, seed, config, relocate=relocate
+        )
+    else:
+        trace = []
+        best, evaluation, iterations = vendor.tabu_search(
+            inst, None, False, seconds, seed, initial, config, beta=config["beta"],
+            I1=config["restart_best"], I2=config["restart_new"], trace=trace,
+        )
+    return {"flow": dense_flow(best), "iterations": iterations, "reported": float(evaluation.cmax),
+            "history": trace, "diagnostics": diagnostics}

@@ -18,6 +18,7 @@ from unittest.mock import patch
 import check_instance
 import method_thao
 import method_claude
+import method_elite
 from method_ga_colab import GA_SETTINGS
 from pdpcr import core, flow_evolution, flow_operators, genetic, pilot_genetic, search
 from run_benchmark import write_csv
@@ -41,6 +42,7 @@ ABLATIONS = {
 }
 EXTRA = (*ABLATIONS, "ga_cut", "ga_cut_mutation", "ga_reroute_mutation", "ga_cut_memetic",
          "mls_cut", "ms_tsr", "duc_beta05", "duc_beta07", "duc_restart150")
+TSR_VARIANTS = ("thao_original", "claude_valid", "claude_relocate", "thao_elite", "claude_elite")
 PRESETS = {"quick": QUICK, "pilot": ("duc", "claude", "ga_pure", "ga_pilot", "mls"),
            "calibration": ("duc", "claude", "duc_beta05", "duc_beta07", "duc_restart150"),
            "ablation": QUICK + EXTRA}
@@ -124,9 +126,17 @@ def multi_start_tsr(instance, initial, seed, seconds, settings):
 
 
 def solve(instance, initial, seed, seconds, method, settings):
-    if method in ("thao", "claude"):
-        implementation = method_thao if method == "thao" else method_claude
-        result = implementation.run(vars(instance), initial.tolist(), seed, seconds, settings)
+    if method in ("thao_elite", "claude_elite"):
+        engine = "thao" if method == "thao_elite" else "claude"
+        result = method_elite.run(vars(instance), initial.tolist(), seed, seconds, settings, engine=engine)
+        return {**result, "objective": result["reported"], "iterations_completed": result["iterations"]}
+    if method in ("thao", "thao_original", "claude", "claude_valid", "claude_relocate"):
+        arguments = (vars(instance), initial.tolist(), seed, seconds, settings)
+        if method in ("thao", "thao_original"):
+            result = method_thao.run(*arguments)
+        else:
+            result = method_claude.run(*arguments, improved=method != "claude",
+                                       relocate=method == "claude_relocate")
         return {**result, "objective": result["reported"], "iterations_completed": result["iterations"]}
     if method == "ms_tsr":
         return multi_start_tsr(instance, initial, seed, seconds, settings)
@@ -162,11 +172,14 @@ def run_seed(path, method, seed, seconds, destination, source):
         "ga_pilot": PILOT_GA,
         **{name: {**PILOT_GA, **options} for name, options in ABLATIONS.items()},
     }.get(method)
-    if method == "thao":
+    if method in ("thao", "thao_original", "thao_elite"):
+        original = method != "thao"
+        if original:
+            settings = method_thao.original_settings()
         import_module("pandas")  # Load the vendor module's dependency before timing its search.
         for module in ("config", "problem_variables", "helpers", "heuristic"):
-            method_thao._compile_module(module)
-    elif method == "claude":
+            method_thao._compile_module(module, module == "heuristic" and original)
+    if method in ("claude", "claude_valid", "claude_relocate", "thao_elite", "claude_elite"):
         method_claude._load_tsr()
     with ExitStack() as stack:
         for module in (genetic, pilot_genetic, flow_operators, flow_evolution, search, duc_search):
@@ -272,7 +285,7 @@ def paired_tests(out):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instances", nargs="+", required=True, type=Path)
-    parser.add_argument("--methods", nargs="+", choices=QUICK + EXTRA)
+    parser.add_argument("--methods", nargs="+", choices=QUICK + EXTRA + TSR_VARIANTS)
     parser.add_argument("--preset", choices=PRESETS, default="quick")
     parser.add_argument("--seconds", type=float, default=600)
     parser.add_argument("--seconds-by-size", action="store_true", help="Use 30/60/120 CPU s for 50/100/200 tasks")
