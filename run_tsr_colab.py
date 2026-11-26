@@ -225,12 +225,14 @@ def write_report(path, rows):
 
 
 def run_colab(seconds, seeds, ts_method, output_root, revision, instances=(INSTANCE_NAME,),
-              *, compare_two_phase=False):
+              *, compare_two_phase=False, integrated_only=False):
     """Run methods with the same start and return the result archive path."""
     if ts_method not in (TWO_PHASE, "claude_elite", INTEGRATED):
         raise ValueError("TS_METHOD không hợp lệ.")
     if compare_two_phase and ts_method != INTEGRATED:
         raise ValueError("So sánh ba bản yêu cầu phương pháp tích hợp.")
+    if integrated_only and (ts_method != INTEGRATED or compare_two_phase):
+        raise ValueError("Chế độ chạy riêng chỉ dùng phương pháp tích hợp.")
     if not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("TIME_LIMIT phải là một số dương hữu hạn.")
     if not seeds or any(type(seed) is not int or not 0 <= seed < 2**32 for seed in seeds):
@@ -252,8 +254,10 @@ def run_colab(seconds, seeds, ts_method, output_root, revision, instances=(INSTA
     settings = [revision, platform.platform(), platform.python_version(), versions, seconds, seeds, ts_method]
     if names != (INSTANCE_NAME,):
         settings.append(names)
-    methods = (BASELINE, TWO_PHASE, ts_method) if compare_two_phase else (BASELINE, ts_method)
+    methods = (ts_method,) if integrated_only else (BASELINE, ts_method)
     if compare_two_phase:
+        methods = (BASELINE, TWO_PHASE, ts_method)
+    if compare_two_phase or integrated_only:
         settings.append(methods)
     tag = hashlib.sha256(json.dumps(settings).encode()).hexdigest()[:10]
     suite = names[0] if len(names) == 1 else f"pdpcr_{len(names)}x50"
@@ -262,7 +266,14 @@ def run_colab(seconds, seeds, ts_method, output_root, revision, instances=(INSTA
     print(f"Kết quả từng seed đã xong được ghi ở {out}", flush=True)
 
     run_benchmark(source, paths, out, env, methods, seconds, seeds)
-    report_results(out, seeds, ts_method, names)
+    if integrated_only:
+        with (out / "summary.csv").open(encoding="utf-8", newline="") as handle:
+            print("\nMakespan của TSR tích hợp")
+            for row in csv.DictReader(handle):
+                print(f"{row['instance']} | trung bình {float(row['mean']):.4f}"
+                      f" | tốt nhất {float(row['best']):.4f} | {row['seeds']} seed")
+    else:
+        report_results(out, seeds, ts_method, names)
     if compare_two_phase:
         report_results(out, seeds, TWO_PHASE, names, suffix="_two_phase")
         report_results(out, seeds, ts_method, names, baseline=TWO_PHASE, suffix="_vs_two_phase")
