@@ -42,7 +42,8 @@ ABLATIONS = {
 }
 EXTRA = (*ABLATIONS, "ga_cut", "ga_cut_mutation", "ga_reroute_mutation", "ga_cut_memetic",
          "mls_cut", "ms_tsr", "duc_beta05", "duc_beta07", "duc_restart150")
-TSR_VARIANTS = ("thao_original", "claude_valid", "claude_relocate", "thao_elite", "claude_elite")
+TSR_VARIANTS = ("thao_original", "claude_valid", "claude_relocate",
+                "thao_elite", "claude_elite", "thao_integrated")
 PRESETS = {"quick": QUICK, "pilot": ("duc", "claude", "ga_pure", "ga_pilot", "mls"),
            "calibration": ("duc", "claude", "duc_beta05", "duc_beta07", "duc_restart150"),
            "ablation": QUICK + EXTRA}
@@ -130,9 +131,9 @@ def solve(instance, initial, seed, seconds, method, settings):
         engine = "thao" if method == "thao_elite" else "claude"
         result = method_elite.run(vars(instance), initial.tolist(), seed, seconds, settings, engine=engine)
         return {**result, "objective": result["reported"], "iterations_completed": result["iterations"]}
-    if method in ("thao", "thao_original", "claude", "claude_valid", "claude_relocate"):
+    if method in ("thao", "thao_original", "thao_integrated", "claude", "claude_valid", "claude_relocate"):
         arguments = (vars(instance), initial.tolist(), seed, seconds, settings)
-        if method in ("thao", "thao_original"):
+        if method in ("thao", "thao_original", "thao_integrated"):
             result = method_thao.run(*arguments)
         else:
             result = method_claude.run(*arguments, improved=method != "claude",
@@ -172,14 +173,18 @@ def run_seed(path, method, seed, seconds, destination, source):
         "ga_pilot": PILOT_GA,
         **{name: {**PILOT_GA, **options} for name, options in ABLATIONS.items()},
     }.get(method)
-    if method in ("thao", "thao_original", "thao_elite"):
+    integrated = method == "thao_integrated"
+    if method in ("thao", "thao_original", "thao_elite", "thao_integrated"):
         original = method != "thao"
         if original:
             settings = method_thao.original_settings()
+        if integrated:
+            settings["integrated_relocation"] = True
         import_module("pandas")  # Load the vendor module's dependency before timing its search.
         for module in ("config", "problem_variables", "helpers", "heuristic"):
-            method_thao._compile_module(module, module == "heuristic" and original)
-    if method in ("claude", "claude_valid", "claude_relocate", "thao_elite", "claude_elite"):
+            method_thao._compile_module(module, module == "heuristic" and original,
+                                        module == "heuristic" and integrated)
+    if method in ("claude", "claude_valid", "claude_relocate", "thao_elite", "claude_elite", "thao_integrated"):
         method_claude._load_tsr()
     with ExitStack() as stack:
         for module in (genetic, pilot_genetic, flow_operators, flow_evolution, search, duc_search):

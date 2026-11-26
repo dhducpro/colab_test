@@ -115,7 +115,7 @@ def _critical_tasks(inst, evaluation):
     return dict.fromkeys(task for arc in critical for task in arc if 1 <= task <= inst.n)
 
 
-def relocate_task(inst, flow, ev, ops, rng, deadline, max_tasks=6):
+def relocate_task(inst, flow, ev, ops, rng, deadline, max_tasks=6, *, score_limit=float("inf")):
     """Return a strictly improving (flow, evaluation), or None.
 
     Each sampled critical task is removed with one balance-preserving bypass
@@ -124,7 +124,7 @@ def relocate_task(inst, flow, ev, ops, rng, deadline, max_tasks=6):
     the task for that pairing and order. The process-time deadline bounds
     the search, which may return a better assignment found before timeout.
     """
-    best_score, best_plan = ev.cmax, None
+    best_score, best_plan = min(ev.cmax, score_limit), None
     for task in list(_critical_tasks(inst, ev))[:max_tasks]:
         if process_time() >= deadline:
             break

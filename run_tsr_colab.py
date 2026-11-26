@@ -20,6 +20,14 @@ from urllib.request import urlopen
 
 INSTANCE_NAME = "lr108-5-uniform"
 BASELINE = "thao_original"
+INTEGRATED = "thao_integrated"
+TWO_PHASE = "thao_elite"
+METHOD_LABELS = {
+    BASELINE: "TSR gốc",
+    INTEGRATED: "Tích hợp từ đầu",
+    TWO_PHASE: "TSR hai pha",
+    "claude_elite": "Claude hai pha",
+}
 THAO_DATA_REVISION = "c85c247550f6232e6aec519b15824e283ee87883"
 THAO_DATA_URL = (
     "https://raw.githubusercontent.com/thaonc97/thao_phd_model/"
@@ -127,7 +135,7 @@ def run_benchmark(source, instances, out, env, methods, seconds, seeds):
     total = len(groups) * len(seeds)
     show_finished(out, groups, seeds, seen)
     print(
-        f"Với mỗi instance: {methods[0]} → {methods[1]}. "
+        f"Với mỗi instance: {' → '.join(methods)}. "
         f"Mỗi nhóm có {len(seeds)} seed chạy song song. Tổng {total} lượt.",
         flush=True,
     )
@@ -167,7 +175,7 @@ def run_benchmark(source, instances, out, env, methods, seconds, seeds):
         raise RuntimeError(f"Benchmark dừng với mã lỗi {proc.returncode}. Nhật ký {log_path}")
 
 
-def report_results(out, seeds, ts_method, names=(INSTANCE_NAME,)):
+def report_results(out, seeds, ts_method, names=(INSTANCE_NAME,), *, baseline=BASELINE, suffix=""):
     with (out / "runs.csv").open(encoding="utf-8", newline="") as handle:
         rows = {(row["instance"], row["method"], int(row["seed"])): row for row in csv.DictReader(handle)}
     pairs = []
@@ -175,10 +183,11 @@ def report_results(out, seeds, ts_method, names=(INSTANCE_NAME,)):
     tolerance = 1e-7
     for name in names:
         instance_pairs = []
+        label_baseline, label_proposed = METHOD_LABELS[baseline], METHOD_LABELS[ts_method]
         print(f"\n{name}")
-        print(f"{'Seed':>5} {'TSR gốc':>13} {'TS cải tiến':>15} {'Giảm (%)':>11}")
+        print(f"{'Seed':>5} {label_baseline:>16} {label_proposed:>16} {'Giảm (%)':>11}")
         for seed in seeds:
-            original, proposed = rows[name, BASELINE, seed], rows[name, ts_method, seed]
+            original, proposed = rows[name, baseline, seed], rows[name, ts_method, seed]
             initial = float(original["initial"])
             if abs(initial - float(proposed["initial"])) > tolerance:
                 raise RuntimeError(f"Hai thuật toán dùng nghiệm đầu khác nhau trên {name}, seed {seed}.")
@@ -186,26 +195,26 @@ def report_results(out, seeds, ts_method, names=(INSTANCE_NAME,)):
             delta = ref - result
             percent = 100 * delta / ref if ref else 0.0
             pair = {"instance": name} if len(names) > 1 else {}
-            pair.update({"seed": seed, "initial": initial, BASELINE: ref, ts_method: result,
+            pair.update({"seed": seed, "initial": initial, baseline: ref, ts_method: result,
                          "makespan_reduction": delta, "reduction_pct": percent})
             instance_pairs.append(pair)
-            print(f"{seed:>5} {ref:>13.4f} {result:>15.4f} {percent:>11.2f}")
-        old_mean = mean(row[BASELINE] for row in instance_pairs)
+            print(f"{seed:>5} {ref:>16.4f} {result:>16.4f} {percent:>11.2f}")
+        old_mean = mean(row[baseline] for row in instance_pairs)
         new_mean = mean(row[ts_method] for row in instance_pairs)
         wins = sum(row["makespan_reduction"] > tolerance for row in instance_pairs)
         ties = sum(abs(row["makespan_reduction"]) <= tolerance for row in instance_pairs)
         losses = len(instance_pairs) - wins - ties
         pct = 100 * (old_mean - new_mean) / old_mean if old_mean else 0.0
-        print(f"Makespan trung bình  |  Thảo {old_mean:.4f}  |  TS cải tiến {new_mean:.4f}")
+        print(f"Makespan trung bình  |  {label_baseline} {old_mean:.4f}  |  {label_proposed} {new_mean:.4f}")
         print(f"Mức giảm {pct:+.2f}%  |  Thắng {wins}, hòa {ties}, thua {losses}")
         pairs.extend(instance_pairs)
-        summaries.append(dict(instance=name, seeds=len(seeds), baseline=BASELINE, proposed=ts_method,
+        summaries.append(dict(instance=name, seeds=len(seeds), baseline=baseline, proposed=ts_method,
                               baseline_mean=old_mean, proposed_mean=new_mean, reduction_pct=pct,
                               wins=wins, ties=ties, losses=losses))
 
-    write_report(out / "paired_results.csv", pairs)
+    write_report(out / f"paired_results{suffix}.csv", pairs)
     if len(names) > 1:
-        write_report(out / "comparison_summary.csv", summaries)
+        write_report(out / f"comparison_summary{suffix}.csv", summaries)
 
 
 def write_report(path, rows):
@@ -215,10 +224,13 @@ def write_report(path, rows):
         writer.writerows(rows)
 
 
-def run_colab(seconds, seeds, ts_method, output_root, revision, instances=(INSTANCE_NAME,)):
-    """Run both methods with the same start and return the result archive path."""
-    if ts_method not in ("thao_elite", "claude_elite"):
-        raise ValueError("TS_METHOD phải là thao_elite hoặc claude_elite.")
+def run_colab(seconds, seeds, ts_method, output_root, revision, instances=(INSTANCE_NAME,),
+              *, compare_two_phase=False):
+    """Run methods with the same start and return the result archive path."""
+    if ts_method not in (TWO_PHASE, "claude_elite", INTEGRATED):
+        raise ValueError("TS_METHOD không hợp lệ.")
+    if compare_two_phase and ts_method != INTEGRATED:
+        raise ValueError("So sánh ba bản yêu cầu phương pháp tích hợp.")
     if not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("TIME_LIMIT phải là một số dương hữu hạn.")
     if not seeds or any(type(seed) is not int or not 0 <= seed < 2**32 for seed in seeds):
@@ -240,15 +252,20 @@ def run_colab(seconds, seeds, ts_method, output_root, revision, instances=(INSTA
     settings = [revision, platform.platform(), platform.python_version(), versions, seconds, seeds, ts_method]
     if names != (INSTANCE_NAME,):
         settings.append(names)
+    methods = (BASELINE, TWO_PHASE, ts_method) if compare_two_phase else (BASELINE, ts_method)
+    if compare_two_phase:
+        settings.append(methods)
     tag = hashlib.sha256(json.dumps(settings).encode()).hexdigest()[:10]
     suite = names[0] if len(names) == 1 else f"pdpcr_{len(names)}x50"
     out = Path(output_root).resolve() / f"{suite}_{seconds:g}s_{ts_method}_{tag}"
     out.mkdir(parents=True, exist_ok=True)
     print(f"Kết quả từng seed đã xong được ghi ở {out}", flush=True)
 
-    methods = (BASELINE, ts_method)
     run_benchmark(source, paths, out, env, methods, seconds, seeds)
     report_results(out, seeds, ts_method, names)
+    if compare_two_phase:
+        report_results(out, seeds, TWO_PHASE, names, suffix="_two_phase")
+        report_results(out, seeds, ts_method, names, baseline=TWO_PHASE, suffix="_vs_two_phase")
     bundle = Path(shutil.make_archive(str(out), "zip", root_dir=out))
     print(f"\nZIP kết quả  {bundle}", flush=True)
     return bundle

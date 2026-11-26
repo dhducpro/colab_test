@@ -32,7 +32,7 @@ def _replace_once(source, old, new):
     return source.replace(old, new)
 
 
-def _instrument(source, use_original_cut_update=False):
+def _instrument(source, use_original_cut_update=False, integrated_relocation=False):
     # Keep the dependency optional for the four separate integer-programming
     # methods. The tabu search and its randomized restart do not use them.
     source = _replace_once(source, "from docplex.mp.model import Model",
@@ -87,15 +87,47 @@ def _instrument(source, use_original_cut_update=False):
     # f-string; zero candidates is a valid benchmark control.
     source = source.replace("/cfg.TABU_NUM_REROUTE_NEIGHBORS}", "/max(1, cfg.TABU_NUM_REROUTE_NEIGHBORS)}")
     source = source.replace("/cfg.TABU_NUM_REVERSE_NEIGHBORS}", "/max(1, cfg.TABU_NUM_REVERSE_NEIGHBORS)}")
+    if integrated_relocation:
+        source = _instrument_relocation(source)
+    return source
+
+
+def _instrument_relocation(source):
+    for name in ("num_improve", "total_improve"):
+        source = _replace_once(source, f"{name} = {{0:0, 1:0}}", f"{name} = {{0:0, 1:0, 2:0}}")
+    source = _replace_once(source, "            if best_neighbor is None:\n"
+                           "                logging.info(f'No neighbor found')\n"
+                           "                break\n", "")
+    source = _replace_once(
+        source, "            if best_neighbor_fitness < best_solution_fitness:",
+        "            relocation = self.relocation_candidate(lastest_best_solution,\n"
+        "                best_neighbor_fitness, best_solution_fitness, tl_add, tl_drop)\n"
+        "            self.check_budget()\n"
+        "            if relocation is not None:\n"
+        "                best_neighbor, best_neighbor_fitness, removed, added = relocation\n"
+        "                chosen_neigborhood = 2\n"
+        "            if best_neighbor is None:\n"
+        "                logging.info('No neighbor found')\n"
+        "                break\n"
+        "            if best_neighbor_fitness < best_solution_fitness:",
+    )
+    source = _replace_once(
+        source, "            if len(tl_add) > tabu_list_size:",
+        "            if chosen_neigborhood == 2:\n"
+        "                tl_add = (tl_add + removed)[-tabu_list_size:] if tabu_list_size else []\n"
+        "                tl_drop = (tl_drop + added)[-tabu_list_size:] if tabu_list_size else []\n"
+        "                self.diagnostics['accepted_relocations'] += 1\n"
+        "            if len(tl_add) > tabu_list_size:",
+    )
     return source
 
 
 @lru_cache(maxsize=None)
-def _compile_module(name, use_original_cut_update=False):
+def _compile_module(name, use_original_cut_update=False, integrated_relocation=False):
     path = VENDOR / f"{name}.py"
     source = path.read_text(encoding="utf-8-sig")
     if name == "heuristic":
-        source = _instrument(source, use_original_cut_update)
+        source = _instrument(source, use_original_cut_update, integrated_relocation)
     return compile(source, str(path), "exec")
 
 
@@ -126,7 +158,8 @@ def _load_modules(config, seed):
             module.__file__ = str(path)
             sys.modules[name] = module
             use_original_cut_update = name == "heuristic" and config.get("use_original_cut_update", False)
-            exec(_compile_module(name, use_original_cut_update), module.__dict__)
+            integrated_relocation = name == "heuristic" and config.get("integrated_relocation", False)
+            exec(_compile_module(name, use_original_cut_update, integrated_relocation), module.__dict__)
             if name == "config":
                 module.RND_SEED = seed
                 module.TABU_REDISTRIBUTE_PROB = config["beta"]
@@ -145,6 +178,63 @@ def _load_modules(config, seed):
                 module.TABU_LOG_PARAMETERES = False
             modules[name] = module
     return modules["problem_variables"], modules["heuristic"]
+
+
+def _configure_relocation(search, instance_dict, initial_dense, seed, deadline):
+    from method_claude import prepare_sparse
+    from pdpcr.tsr_relocate import EPSILON, relocate_task
+
+    instance, _, ops = prepare_sparse(instance_dict, initial_dense)
+    sink = instance.n + 1
+    rng = random.Random(seed)
+    stats = search.diagnostics
+    stats.update(relocation_trials=0, accepted_relocations=0, tabu_relocations=0,
+                 first_relocation_trial=None, relocation_cpu_s=0.0)
+
+    def candidate(graph, cutoff, incumbent, tl_add, tl_drop):
+        started = process_time()
+        if started >= deadline:
+            return None
+        if stats["first_relocation_trial"] is None:
+            stats["first_relocation_trial"] = search.completed + 1
+        stats["relocation_trials"] += 1
+        try:
+            flow = ops.empty_sol(instance.n)
+            old = {(i, j): int(data["weight"]) for i, j, data in graph.edges(data=True)}
+            for (i, j), weight in old.items():
+                if weight:
+                    ops.add_flow(flow, sink if i == -1 else i, sink if j == -1 else j, weight)
+            evaluation = ops.evaluate(instance, flow)
+            if evaluation is None:
+                raise ValueError("TSR returned a cyclic flow before relocation.")
+            proposal = relocate_task(instance, flow, evaluation, ops, rng,
+                                     min(deadline, started + 0.01), max_tasks=2,
+                                     score_limit=cutoff)
+            if proposal is None:
+                return None
+            relocated, evaluation = proposal
+            new = {(-1 if i == sink else i, -1 if j == sink else j): int(weight)
+                   for i, arcs in enumerate(relocated[0]) for j, weight in arcs.items()}
+            removed = [arc for arc, weight in old.items() if new.get(arc, 0) < weight]
+            added = [arc for arc, weight in new.items() if old.get(arc, 0) < weight]
+            if evaluation.cmax >= incumbent - EPSILON and (
+                set(added).intersection(tl_add) or set(removed).intersection(tl_drop)
+            ):
+                stats["tabu_relocations"] += 1
+                return None
+            result = graph.copy()
+            result.remove_edges_from(arc for arc in removed if arc not in new)
+            for i, j in new:
+                if old.get((i, j)) != new[i, j]:
+                    result.add_edge(i, j, weight=new[i, j])
+            score = search._get_fitness(result)
+            if abs(score - evaluation.cmax) > 1e-7:
+                raise ValueError("Relocation score disagrees with the native TSR evaluator.")
+            return (result, score, removed, added) if score < cutoff - EPSILON else None
+        finally:
+            stats["relocation_cpu_s"] += process_time() - started
+
+    search.relocation_candidate = candidate
 
 
 def run(instance_dict, initial_dense, seed, seconds, config):
@@ -196,6 +286,8 @@ def run(instance_dict, initial_dense, seed, seconds, config):
     search.diagnostics = {"tie_guard_uses": 0, "accepted_redistribute": 0, "max_cut_tabu_length": 0}
     search.check_budget = check_budget
     search.checkpoint = checkpoint
+    if config.get("integrated_relocation"):
+        _configure_relocation(search, instance_dict, initial_dense, seed, deadline)
     try:
         best_graph, best_score, _, _ = search.search(instance_dict["robots"], 10**9, config["tenure_arc"])
     except _TimeLimit:
